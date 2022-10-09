@@ -6,7 +6,7 @@ import torch.optim as optim
 import numpy as np
 from sklearn.metrics import roc_auc_score, accuracy_score
 
-from src.evaluate import get_all_metrics
+from src.evaluate import get_hit, get_ndcg
 from src.load_base import get_records, load_kg
 
 
@@ -198,22 +198,23 @@ class KARN(nn.Module):
         return t.sigmoid(result)  # (batch_size, dim)
 
 
-def get_scores(model, rec, paths_dict, args, user_records, relation_dict, n_relation, kg_dict):
-    rec_item_dict = {}
+def eval_topk(model, rec, paths_dict, args, user_records, relation_dict, n_relation, kg_dict, topk):
+    HR, NDCG = [], []
     model.eval()
     for user in rec:
-
-        pairs = [(user, item) for item in rec[user]]
+        items = rec[user]
+        pairs = [(user, item) for item in items]
         input_data = get_input_data(args, pairs, paths_dict, user_records, relation_dict, n_relation, kg_dict)
         predict = model(input_data[0], input_data[1], input_data[2], input_data[3], input_data[4])
         predict_np = predict.detach().cpu().numpy()
-        item_scores = {rec[user][i]: predict_np[i] for i in range(len(pairs))}
+        n = len(predict_np)
+        item_scores = {items[i]: predict_np[i] for i in range(n)}
+        item_list = list(dict(sorted(item_scores.items(), key=lambda x: x[1], reverse=True)).keys())[: topk]
+        HR.append(get_hit(items[-1], item_list))
+        NDCG.append(get_ndcg(items[-1], item_list))
 
-        sorted_item_scores = sorted(item_scores.items(), key=lambda x: x[1], reverse=True)
-
-        rec_item_dict[user] = [i[0] for i in sorted_item_scores]
     model.train()
-    return rec_item_dict
+    return np.mean(HR), np.mean(NDCG)
 
 
 def get_input_data(args, pairs, paths_dict, user_records, relation_dict, n_relation, kg_dict):
@@ -311,9 +312,10 @@ def train(args, is_topk=False):
     train_set = np.load(data_dir + str(args.ratio) + '_train_set.npy').tolist()
     eval_set = np.load(data_dir + str(args.ratio) + '_eval_set.npy').tolist()
     test_set = np.load(data_dir + str(args.ratio) + '_test_set.npy').tolist()
-    test_records = get_records(test_set)
+
     entity_list = np.load(data_dir + '_entity_list.npy').tolist()
     relation_dict = np.load(data_dir + str(args.ratio) + '_relation_dict.npy', allow_pickle=True).item()
+    rec = np.load(data_dir + str(args.ratio) + '_rec.npy.', allow_pickle=True).item()
     n_entity = len(entity_list)
     paths_dict = np.load(data_dir + str(args.ratio) + '_3_path_dict.npy', allow_pickle=True).item()
     kg_dict, _, n_relation = load_kg(data_dir)
@@ -334,7 +336,9 @@ def train(args, is_topk=False):
     eval_acc_list = []
     test_auc_list = []
     test_acc_list = []
-    all_precision_list = []
+    HR_list = []
+    NDCG_list = []
+
     for epoch in range(args.epochs):
         loss_sum = 0
         start = time.clock()
@@ -368,9 +372,10 @@ def train(args, is_topk=False):
               'eval_auc: %.4f \t eval_acc: %.4f \t test_auc: %.4f \t test_acc: %.4f \t' %
               ((epoch + 1), train_auc, train_acc, eval_auc, eval_acc, test_auc, test_acc), end='\t')
 
-        precision_list = []
+        HR, NDCG = 0, 0
         if is_topk:
-            pass
+            HR, NDCG = eval_topk(model, rec, paths_dict, args, user_records, relation_dict, n_relation, kg_dict, args.topk)
+            print('HR: %.4f NDCG: %.4f' % (HR, NDCG), end='\t')
 
         train_auc_list.append(train_auc)
         train_acc_list.append(train_acc)
@@ -378,7 +383,9 @@ def train(args, is_topk=False):
         eval_acc_list.append(eval_acc)
         test_auc_list.append(test_auc)
         test_acc_list.append(test_acc)
-        all_precision_list.append(precision_list)
+        HR_list.append(HR)
+        NDCG_list.append(NDCG)
+
         end = time.clock()
         print('time: %d' % (end - start))
 
@@ -389,6 +396,6 @@ def train(args, is_topk=False):
           (train_auc_list[indices], train_acc_list[indices], eval_auc_list[indices], eval_acc_list[indices],
            test_auc_list[indices], test_acc_list[indices]), end='\t')
 
-    print(all_precision_list[indices])
+    print('HR: %.4f \t NDCG: %.4f' % (HR_list[indices], NDCG_list[indices]))
 
     return eval_auc_list[indices], eval_acc_list[indices], test_auc_list[indices], test_acc_list[indices]
